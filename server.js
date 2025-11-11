@@ -2,15 +2,20 @@
 'use strict';
 
 /*
-  Quiplash-like game server (updated)
-  - Prompts are now randomized every round (no repeated fixed list)
-  - Submission and voting timers are 60s
+  Quiplash-like game server (updated full script)
+  - Fresh randomized prompt every round (no reused fixed list)
+  - Optional OpenAI fallback for prompts via OPENAI_API_KEY
+  - 60s submission and 60s voting timers (reset between phases)
   - Broadcasts submission progress (playerSubmitted / allSubmissions)
+  - Ends phases early if everyone submits or votes
   - In-memory state; restart clears state
 */
 
 const http = require('http');
 const WebSocket = require('ws');
+
+// If running on Node < 18, provide fetch via node-fetch dynamically
+const fetch = global.fetch || ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
 const PORT = process.env.PORT || 3000;
 const MAX_MESSAGE_SIZE = 64 * 1024;
@@ -18,8 +23,8 @@ const PING_INTERVAL_MS = 30_000;
 
 const MAX_PLAYERS_PER_LOBBY = 8;
 const ROUNDS_PER_GAME = 5;
-const SUBMISSION_SECONDS = 60; // 1 minute
-const VOTING_SECONDS = 60;     // 1 minute
+const SUBMISSION_SECONDS = 60; // 1 minute submission
+const VOTING_SECONDS = 60;     // 1 minute voting
 
 // --- Utilities ---
 const makeId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -44,7 +49,6 @@ function ensureRoom(roomId) {
       hostId: null,
       phase: 'lobby',
       roundIndex: 0,
-      // prompts are generated per-round now
       currentPrompt: null,
       submissions: new Map(),
       votes: new Map(),
@@ -99,102 +103,155 @@ function resetGameState(room) {
   room.currentPrompt = null;
   room.submissions = new Map();
   room.votes = new Map();
-  room.timers = {};
+  clearTimers(room);
   for (const p of room.players.values()) { p.score = p.score || 0; p.ready = false; }
 }
 
-// --- Prompt generation (random each round) ---
-function randInt(max) {
-  return Math.floor(Math.random() * max);
-}
+// ===== Funny prompt generator (local, per-round randomized) =====
+const PROMPT_THEMES = {
+  everyday: [
+    "The illegal new flavor of potato chips is ___",
+    "My cat’s secret 5-year plan includes ___",
+    "A mysterious item always found in my pockets is ___",
+    "The most polite way to return a borrowed lawnmower is ___",
+    "My most chaotic alarm sound would be ___",
+    "The last thing I’d delete from my phone is ___",
+  ],
+  dating: [
+    "The fastest way to end a first date is ___",
+    "A cursed engagement ring feature is ___",
+    "My red flag disguised as a fun fact is ___",
+    "The line that gets you banned from wedding toasts is ___",
+    "The most confusing reply to “wyd?” is ___",
+  ],
+  work: [
+    "The worst email sign-off is ___",
+    "The most cursed Zoom background is ___",
+    "Detention for doing ___",
+    "A dystopian new company motto is ___",
+    "The weirdest extra credit assignment is ___",
+  ],
+  inventions: [
+    "The app that exists only to ___",
+    "Teleportation works perfectly, but you always arrive ___",
+    "A vending machine that dispenses ___ when you press “Surprise”",
+    "A magic mirror that roasts you for ___",
+    "Flying shoes that only lift you when ___",
+  ],
+  pop: [
+    "The franchise that should never be rebooted as ___",
+    "Contestants compete by ___ in a new reality show",
+    "A superhero’s useless power is ___",
+    "The post-credits reveal is ___",
+    "The challenge everyone regrets is ___",
+  ],
+  food: [
+    "Cursed pizza topped with ___ and regret",
+    "Earn a Michelin star by serving ___",
+    "Soup becomes interesting when ___",
+    "You’re banned from the buffet after piling ___",
+    "Ask for the secret menu item ___ and they nod silently",
+  ],
+  life: [
+    "You wake up with the ability to ___",
+    "A tiny inconvenience that ruins the week is ___",
+    "We celebrate ___ by doing ___",
+    "The brag that only impresses three people is ___",
+    "Genie grants your wish but adds ___",
+  ],
+  time: [
+    "A gladiator’s subtweet would say ___",
+    "In 2099 we pay with ___",
+    "1-star review for Earth: “___”",
+    "The silly thing that ends civilization is ___",
+    "Mars HOA fines you for ___",
+  ],
+};
 
-const PROMPT_BASE = [
-  "My secret talent is ___",
-  "The worst thing to say on a first date is ___",
-  "If I were invisible for a day I'd ___",
-  "The new reality show should be called ___",
-  "The worst superpower is ___",
-  "My autobiography would be titled ___",
-  "The strangest thing I keep in my fridge is ___",
-  "The best excuse to leave a party early is ___",
-  "The most useless invention is ___",
-  "If pets could talk they'd say ___",
-  "The worst advice I ever got was ___",
-  "A terrible theme for a children's book is ___",
-  "The last thing I would bring to a desert island is ___",
-  "The most awkward thing to say at a funeral is ___",
-  "If I had a time machine I'd go to ___",
-  "The worst job interview answer is ___",
-  "The strangest hobby I secretly enjoy is ___",
-  "A bad name for a perfume would be ___",
-  "The worst thing to shout in a crowded elevator is ___",
-  "If I were a villain my catchphrase would be ___"
-];
-
-const PROMPT_MODIFIERS = [
-  "for a reality show",
+const MODIFIERS = [
   "in a fantasy world",
-  "on a first date",
-  "at a job interview",
-  "as a superhero",
-  "in a horror movie",
-  "as a product name",
-  "as a children's story",
-  "as a late-night ad",
-  "as a motivational quote",
   "during a blackout",
   "on a spaceship",
   "at a family reunion",
-  "in a cooking show",
-  "as a board game title"
+  "as a motivational quote",
+  "as a product tagline",
+  "on a reality show",
+  "at a job interview",
+  "in a horror movie",
+  "as a children’s story"
 ];
 
-const PROMPT_ADJECTIVES = [
-  "absurd",
-  "awkward",
-  "unexpected",
-  "hilarious",
-  "dark",
-  "silly",
-  "surprising",
-  "bizarre",
-  "delightful",
-  "ridiculous"
+const ADJECTIVES = [
+  "absurd", "awkward", "unexpected", "hilarious",
+  "dark", "silly", "surprising", "bizarre", "delightful", "ridiculous"
 ];
+
+function randItem(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function spicePrompt(base) {
+  if (Math.random() < 0.6) {
+    const mod = randItem(MODIFIERS);
+    if (base.includes("___")) base = base.replace("___", `${mod} ___`);
+    else base = `${base} ${mod} ___`;
+  }
+  if (Math.random() < 0.3) {
+    const adj = randItem(ADJECTIVES);
+    base = `${adj.charAt(0).toUpperCase() + adj.slice(1)}: ${base}`;
+  }
+  if (Math.random() < 0.15) base = base.replace(/\?$/, "") + "...";
+  return base;
+}
 
 function generatePromptSingle() {
-  // pick a base
-  const base = PROMPT_BASE[randInt(PROMPT_BASE.length)];
-  // 50% chance to add a modifier
-  let prompt = base;
-  if (Math.random() < 0.6) {
-    const mod = PROMPT_MODIFIERS[randInt(PROMPT_MODIFIERS.length)];
-    // if base contains '___' keep it; otherwise append modifier before blank
-    if (base.includes('___')) {
-      // sometimes insert modifier before blank
-      prompt = base.replace('___', `${mod} ___`);
-    } else {
-      prompt = `${base} ${mod} ___`;
-    }
-  }
-  // 30% chance to prepend an adjective phrase
-  if (Math.random() < 0.3) {
-    const adj = PROMPT_ADJECTIVES[randInt(PROMPT_ADJECTIVES.length)];
-    prompt = `${adj.charAt(0).toUpperCase() + adj.slice(1)}: ${prompt}`;
-  }
-  // small random punctuation tweak
-  if (Math.random() < 0.15) prompt = prompt.replace(/\?$/, '') + '...';
-  return prompt;
+  const themeKeys = Object.keys(PROMPT_THEMES);
+  const theme = randItem(themeKeys);
+  const base = randItem(PROMPT_THEMES[theme]);
+  return spicePrompt(base);
 }
 
-function generatePrompts(n) {
-  const out = [];
-  for (let i = 0; i < n; i++) out.push(generatePromptSingle());
-  return out;
+// Optional: ask OpenAI for a fresh prompt (fallback to local if fails)
+// Set OPENAI_API_KEY in your environment to enable
+async function generatePromptAI() {
+  if (!process.env.OPENAI_API_KEY) return null;
+  try {
+    const prompt = `Give one original, funny party game prompt with a blank using "___".
+Avoid profanity and slurs. Keep it under 120 characters.`;
+
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You generate creative, safe party game prompts." },
+          { role: "user", content: prompt }
+        ],
+        temperature: 0.9,
+        max_tokens: 80,
+      })
+    });
+
+    const data = await res.json();
+    const text = data?.choices?.[0]?.message?.content?.trim();
+    if (text && text.includes("___")) return text;
+    if (text) return text.replace(/\s*$/, " ___");
+    return null;
+  } catch {
+    return null;
+  }
 }
 
-// --- Game flow ---
-function startGame(roomId) {
+// Wrapper that prefers AI if available, falls back to local
+async function getFreshPrompt() {
+  const ai = await generatePromptAI();
+  return ai || generatePromptSingle();
+}
+
+// --- Game flow (async for prompt fetching) ---
+async function startGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
@@ -203,28 +260,42 @@ function startGame(roomId) {
     return;
   }
 
-  // pick a fresh prompt for the first round
   room.roundIndex = 0;
   room.phase = 'submission';
   room.submissions = new Map();
   room.votes = new Map();
-  room.currentPrompt = generatePromptSingle();
+  room.currentPrompt = await getFreshPrompt();
 
   for (const p of room.players.values()) p.score = 0;
 
-  broadcast(roomId, { type: 'gameStarted', rounds: ROUNDS_PER_GAME, prompt: room.currentPrompt, seconds: SUBMISSION_SECONDS, playersCount: room.players.size });
+  broadcast(roomId, {
+    type: 'gameStarted',
+    rounds: ROUNDS_PER_GAME,
+    prompt: room.currentPrompt,
+    seconds: SUBMISSION_SECONDS,
+    playersCount: room.players.size
+  });
   startSubmissionPhase(roomId);
 }
 
 function startSubmissionPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
+
   room.phase = 'submission';
   room.submissions = new Map();
   room.votes = new Map();
-  // ensure currentPrompt exists (should be set by caller)
-  if (!room.currentPrompt) room.currentPrompt = generatePromptSingle();
-  broadcast(roomId, { type: 'roundStarted', round: room.roundIndex + 1, prompt: room.currentPrompt, phase: 'submission', seconds: SUBMISSION_SECONDS, totalPlayers: room.players.size });
+
+  // Ensure a prompt exists (async prefetch done in startGame/endVotingPhase)
+  broadcast(roomId, {
+    type: 'roundStarted',
+    round: room.roundIndex + 1,
+    prompt: room.currentPrompt,
+    phase: 'submission',
+    seconds: SUBMISSION_SECONDS,
+    totalPlayers: room.players.size
+  });
+
   clearTimers(room);
   room.timers.submissionTimer = setTimeout(() => {
     endSubmissionPhase(roomId);
@@ -234,6 +305,8 @@ function startSubmissionPhase(roomId) {
 function endSubmissionPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
+
+  // Fill blanks for non-submitters
   for (const pid of room.players.keys()) {
     if (!room.submissions.has(pid)) room.submissions.set(pid, '');
   }
@@ -243,59 +316,89 @@ function endSubmissionPhase(roomId) {
 function startVotingPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
+
   room.phase = 'voting';
+
   const submissions = [];
   for (const [pid, text] of room.submissions.entries()) submissions.push({ id: pid, text });
-  // shuffle submissions
+
+  // Shuffle submissions
   for (let i = submissions.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [submissions[i], submissions[j]] = [submissions[j], submissions[i]];
   }
-  broadcast(roomId, { type: 'votingStarted', round: room.roundIndex + 1, submissions, seconds: VOTING_SECONDS });
+
+  broadcast(roomId, {
+    type: 'votingStarted',
+    round: room.roundIndex + 1,
+    submissions,
+    seconds: VOTING_SECONDS
+  });
+
   clearTimers(room);
   room.timers.votingTimer = setTimeout(() => {
     endVotingPhase(roomId);
   }, VOTING_SECONDS * 1000);
 }
 
-function endVotingPhase(roomId) {
+async function endVotingPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
+
   const tally = new Map();
   for (const voted of room.votes.values()) {
     if (!tally.has(voted)) tally.set(voted, 0);
     tally.set(voted, tally.get(voted) + 1);
   }
+
   for (const [targetId, count] of tally.entries()) {
     const player = room.players.get(targetId);
     if (player) player.score = (player.score || 0) + count;
   }
+
   const results = [];
   for (const [pid, p] of room.players.entries()) {
-    results.push({ id: pid, name: p.name, score: p.score || 0, submission: room.submissions.get(pid) || '', votes: tally.get(pid) || 0 });
+    results.push({
+      id: pid,
+      name: p.name,
+      score: p.score || 0,
+      submission: room.submissions.get(pid) || '',
+      votes: tally.get(pid) || 0
+    });
   }
   results.sort((a,b) => (b.votes || 0) - (a.votes || 0));
+
   broadcast(roomId, { type: 'roundResults', round: room.roundIndex + 1, results });
+
   room.roundIndex++;
   if (room.roundIndex >= ROUNDS_PER_GAME) {
     endGame(roomId);
   } else {
-    // pick a new random prompt for the next round
-    room.currentPrompt = generatePromptSingle();
-    setTimeout(() => {
-      startSubmissionPhase(roomId);
-    }, 3000);
+    // Get a brand-new prompt for the next round
+    getFreshPrompt().then((nextPrompt) => {
+      room.currentPrompt = nextPrompt;
+      setTimeout(() => { startSubmissionPhase(roomId); }, 3000);
+    }).catch(() => {
+      room.currentPrompt = generatePromptSingle();
+      setTimeout(() => { startSubmissionPhase(roomId); }, 3000);
+    });
   }
 }
 
 function endGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
+
   room.phase = 'ended';
+
   const standings = [];
-  for (const [pid, p] of room.players.entries()) standings.push({ id: pid, name: p.name, score: p.score || 0 });
+  for (const [pid, p] of room.players.entries()) {
+    standings.push({ id: pid, name: p.name, score: p.score || 0 });
+  }
   standings.sort((a,b) => (b.score || 0) - (a.score || 0));
+
   broadcast(roomId, { type: 'gameOver', standings });
+
   setTimeout(() => {
     resetGameState(room);
     pickHostIfNeeded(room);
@@ -337,17 +440,36 @@ wss.on('connection', (ws, req) => {
         room.players.set(playerId, { id: playerId, name, ws, ready: false, joinedAt, score: 0 });
         pickHostIfNeeded(room);
 
-        sendToPlayer(ws, { type: 'joined', id: playerId, room: roomId, hostId: room.hostId, players: snapshotPlayers(room), phase: room.phase });
+        sendToPlayer(ws, {
+          type: 'joined',
+          id: playerId,
+          room: roomId,
+          hostId: room.hostId,
+          players: snapshotPlayers(room),
+          phase: room.phase
+        });
 
         broadcast(roomId, { type: 'playerJoined', player: { id: playerId, name, ready: false, score: 0 } }, playerId);
 
-        // if game already in progress, send current phase info
+        // If game already in progress, send current phase info
         if (room.phase === 'submission') {
-          sendToPlayer(ws, { type: 'roundStarted', round: room.roundIndex + 1, prompt: room.currentPrompt, phase: 'submission', seconds: SUBMISSION_SECONDS, totalPlayers: room.players.size });
+          sendToPlayer(ws, {
+            type: 'roundStarted',
+            round: room.roundIndex + 1,
+            prompt: room.currentPrompt,
+            phase: 'submission',
+            seconds: SUBMISSION_SECONDS,
+            totalPlayers: room.players.size
+          });
         } else if (room.phase === 'voting') {
           const submissions = [];
           for (const [pid, text] of room.submissions.entries()) submissions.push({ id: pid, text });
-          sendToPlayer(ws, { type: 'votingStarted', round: room.roundIndex + 1, submissions, seconds: VOTING_SECONDS });
+          sendToPlayer(ws, {
+            type: 'votingStarted',
+            round: room.roundIndex + 1,
+            submissions,
+            seconds: VOTING_SECONDS
+          });
         }
 
         break;
@@ -406,16 +528,16 @@ wss.on('connection', (ws, req) => {
         }
         room.submissions.set(playerId, text);
 
-        // broadcast submission progress to room
+        // Broadcast submission progress to room
         broadcast(roomId, { type: 'playerSubmitted', id: playerId, count: room.submissions.size, total: room.players.size });
 
-        // ack to submitter
+        // Ack to submitter
         sendToPlayer(ws, { type: 'submissionReceived', id: playerId });
 
-        // if all submissions in, notify and end early
+        // If all submissions in, notify and end early
         if (room.submissions.size >= room.players.size) {
           broadcast(roomId, { type: 'allSubmissions', count: room.submissions.size, total: room.players.size });
-          clearTimeout(room.timers.submissionTimer);
+          if (room.timers.submissionTimer) { clearTimeout(room.timers.submissionTimer); room.timers.submissionTimer = null; }
           endSubmissionPhase(roomId);
         }
         break;
@@ -438,7 +560,7 @@ wss.on('connection', (ws, req) => {
         sendToPlayer(ws, { type: 'voteReceived', from: playerId, voted: votedId });
 
         if (room.votes.size >= room.players.size) {
-          clearTimeout(room.timers.votingTimer);
+          if (room.timers.votingTimer) { clearTimeout(room.timers.votingTimer); room.timers.votingTimer = null; }
           endVotingPhase(roomId);
         }
         break;
