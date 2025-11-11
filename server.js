@@ -9,6 +9,7 @@
   - 5 rounds: submission -> voting -> results
   - Votes award points; final winner announced
   - Simple in-memory state (no DB). Restart clears state.
+  - Modified: host can start game even if only 1 player (useful for testing)
 */
 
 const http = require('http');
@@ -62,7 +63,7 @@ function ensureRoom(roomId) {
       hostId: null,
       phase: 'lobby',
       roundIndex: 0,
-      prompts: [], // can be seeded later
+      prompts: [],
       currentPrompt: null,
       submissions: new Map(),
       votes: new Map(),
@@ -129,11 +130,13 @@ function resetGameState(room) {
 function startGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-  // require at least 2 players
-  if (room.players.size < 2) {
-    broadcast(roomId, { type: 'error', message: 'Need at least 2 players to start' });
+
+  // allow starting with 1 player (useful for testing)
+  if (room.players.size === 0) {
+    broadcast(roomId, { type: 'error', message: 'No players in room' });
     return;
   }
+
   // seed prompts if empty (placeholder prompts)
   if (!room.prompts || room.prompts.length < ROUNDS_PER_GAME) {
     room.prompts = generatePrompts(ROUNDS_PER_GAME);
@@ -335,7 +338,7 @@ wss.on('connection', (ws, req) => {
         p.ready = true;
         broadcast(roomId, { type: 'playerReady', id: playerId });
         // if everyone ready and host exists, host can start; optionally auto-start if you want:
-        const allReady = Array.from(room.players.values()).length >= 2 && Array.from(room.players.values()).every(x => x.ready);
+        const allReady = Array.from(room.players.values()).length >= 1 && Array.from(room.players.values()).every(x => x.ready);
         if (allReady) {
           // notify host that game can be started
           if (room.hostId && room.players.has(room.hostId)) {
