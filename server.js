@@ -2,13 +2,12 @@
 'use strict';
 
 /*
-  Quiplash-like game server (prefab prompts)
-  - Uses a long curated list of prefab prompts to avoid nonsensical generation
-  - Appends a small set of optional extras occasionally for variety
-  - Ensures prompts are not repeated within a single game
+  Quiplash-like game server
+  - Goofier prefab prompts + occasional silly extras
   - 60s submission and 60s voting timers
   - Broadcasts submission progress (playerSubmitted / allSubmissions)
   - Ends phases early if everyone submits or votes
+  - Prevents voting for your own answer (server-side)
   - In-memory state; restart clears state
 */
 
@@ -107,121 +106,110 @@ function resetGameState(room) {
   for (const p of room.players.values()) { p.score = p.score || 0; p.ready = false; }
 }
 
-// --- Prefab prompts and extras ---
-// Curated list of clear, playable prompts. Add or edit to match your group's humor.
+// --- Goofier prefab prompts and extras ---
 const PREFAB_PROMPTS = [
-  "The worst thing to say on a first date is ___",
-  "My secret talent is ___",
-  "The strangest thing I keep in my fridge is ___",
-  "A terrible name for a perfume is ___",
-  "If pets could talk they'd say ___",
-  "The worst excuse to leave a party early is ___",
-  "The most useless invention is ___",
-  "The new reality show should be called ___",
-  "The worst superpower is ___",
-  "My autobiography would be titled ___",
-  "The best excuse to miss work is ___",
-  "A bad slogan for a hospital is ___",
-  "The last thing I would bring to a desert island is ___",
-  "The most awkward thing to say at a funeral is ___",
-  "If I had a time machine I'd go to ___",
-  "The worst job interview answer is ___",
-  "A terrible theme for a children's book is ___",
-  "The strangest hobby I secretly enjoy is ___",
-  "The worst thing to shout in a crowded elevator is ___",
-  "If I were invisible for a day I'd ___",
-  "The most polite way to return a borrowed lawnmower is ___",
-  "The illegal new flavor of potato chips is ___",
-  "My cat’s secret five-year plan includes ___",
-  "The best prank to play on your roommate is ___",
-  "A cursed pizza topping is ___",
-  "The worst thing to put on a resume is ___",
-  "The most confusing reply to 'wyd?' is ___",
-  "A terrible wedding toast line is ___",
-  "The worst thing to say to your boss is ___",
-  "The most awkward thing to find in your pockets is ___",
-  "A bad name for a startup is ___",
-  "The worst thing to whisper during a movie is ___",
-  "The most ridiculous law would ban ___",
-  "The worst mascot for a cereal is ___",
-  "A terrible app idea is ___",
-  "The worst thing to write on a cake is ___",
-  "The most useless life hack is ___",
-  "The worst thing to hear from your Uber driver is ___",
-  "A bad theme for a children's party is ___",
-  "The strangest thing to collect is ___",
-  "The worst flavor for ice cream is ___",
-  "A terrible slogan for a gym is ___",
-  "The worst thing to say at a job interview is ___",
-  "The most awkward thing to say on a first call is ___",
-  "The worst thing to find in your sandwich is ___",
-  "A cursed board game rule is ___",
-  "The worst name for a pet is ___",
-  "The most embarrassing ringtone is ___",
-  "A bad idea for a reality show challenge is ___",
-  "The worst thing to write in a birthday card is ___",
-  "The most useless superpower is ___",
-  "A terrible flavor for coffee is ___",
-  "The worst thing to say at a graduation speech is ___",
-  "A bad name for a perfume is ___",
-  "The worst thing to announce on a bus is ___",
-  "The most awkward thing to say to your neighbor is ___",
-  "A terrible slogan for a bakery is ___",
-  "The worst thing to find in a hotel room is ___",
-  "A bad name for a children's toy is ___",
-  "The worst thing to say during a toast is ___",
-  "The most ridiculous holiday would celebrate ___",
+  "The worst mascot for a breakfast cereal is ___",
+  "My cat's secret side hustle is ___",
+  "A cursed pizza topping that somehow exists is ___",
+  "The worst thing to whisper during a wedding kiss is ___",
+  "The new Olympic sport everyone would lose at is ___",
   "A terrible name for a superhero is ___",
-  "The worst thing to put on a pizza is ___",
+  "The most useless app feature is ___",
+  "The weirdest thing to find in a vending machine is ___",
+  "A bad slogan for a haunted house is ___",
+  "The worst flavor for ice cream is ___",
+  "The most embarrassing ringtone to have is ___",
+  "The worst thing to say to a barista is ___",
+  "A ridiculous law that would definitely exist is ___",
+  "The worst thing to put on a resume is ___",
+  "A terrible name for a pet is ___",
+  "The most awkward thing to shout on a roller coaster is ___",
+  "A cursed board game rule is ___",
+  "The worst thing to write on a cake is ___",
+  "A bad name for a startup is ___",
+  "The most useless superpower is ___",
+  "The worst thing to find in your pockets is ___",
+  "A terrible idea for a reality show is ___",
+  "The worst thing to say on a first date is ___",
+  "A bad name for a perfume is ___",
+  "The most ridiculous holiday would celebrate ___",
+  "The worst thing to announce on a bus is ___",
+  "A terrible slogan for a gym is ___",
+  "The worst thing to whisper in a library is ___",
+  "A cursed flavor of potato chips is ___",
+  "The worst thing to text your boss is ___",
+  "A bad name for a children's toy is ___",
+  "The most awkward thing to say at a funeral is ___",
+  "A terrible name for a band is ___",
+  "The worst thing to say during a job interview is ___",
+  "A ridiculous product to crowdfund is ___",
+  "The worst thing to find in a hotel room is ___",
   "A bad tagline for a dating app is ___",
   "The most awkward thing to say at a family dinner is ___",
   "A terrible name for a podcast is ___",
-  "The worst thing to say to a teacher is ___",
+  "The worst thing to put on a pizza is ___",
+  "A cursed vending machine item is ___",
+  "The worst thing to write in a birthday card is ___",
+  "A bad name for a cocktail is ___",
+  "The most awkward thing to say on live TV is ___",
+  "A terrible theme for a children's party is ___",
+  "The worst thing to shout in a crowded elevator is ___",
+  "A bad name for a fashion brand is ___",
+  "The most embarrassing thing to have as your screensaver is ___",
+  "A terrible name for a baby is ___",
+  "The worst thing to say to your neighbor is ___",
+  "A cursed breakfast cereal prize is ___",
+  "The worst thing to find in your sandwich is ___",
+  "A bad name for a museum exhibit is ___",
+  "The most ridiculous thing to put on a business card is ___",
+  "A terrible flavor for coffee is ___",
+  "The worst thing to say at a graduation speech is ___",
   "A bad slogan for a dentist is ___",
   "The most useless invention for the kitchen is ___",
-  "A terrible flavor for a soda is ___",
-  "The worst thing to say during a job interview is ___",
-  "A bad name for a fashion brand is ___",
+  "A terrible name for a superhero sidekick is ___",
+  "The worst thing to hear from your Uber driver is ___",
+  "A cursed emoji that ruins conversations is ___",
+  "The worst thing to say while giving a toast is ___",
+  "A bad name for a board game is ___",
   "The most awkward thing to find in your backpack is ___",
   "A terrible idea for a theme park ride is ___",
-  "The worst thing to say on live TV is ___",
-  "A bad name for a cocktail is ___",
-  "The most ridiculous product to crowdfund is ___",
-  "A terrible name for a band is ___",
-  "The worst thing to text your boss is ___",
-  "A bad slogan for a funeral home is ___",
-  "The most awkward thing to say at a reunion is ___",
-  "A terrible name for a baby is ___",
-  "The worst thing to put on a resume is ___"
+  "The worst thing to say on a conference call is ___",
+  "A bad name for a bakery is ___",
+  "The most ridiculous thing to sell at a yard sale is ___",
+  "A cursed app notification that never stops is ___",
+  "The worst thing to put on a wedding invitation is ___",
+  "A bad name for a superhero team is ___",
+  "The most awkward thing to say to your teacher is ___",
+  "A terrible flavor for a soda is ___",
+  "The worst thing to find in a fridge is ___",
+  "A bad name for a pet grooming salon is ___",
+  "The most ridiculous thing to be famous for is ___",
+  "A cursed souvenir from a vacation is ___",
+  "The worst thing to say while ordering food is ___"
 ];
 
-// Small set of safe extras to append occasionally for variety
 const EXTRAS = [
-  "— in 30 seconds or less",
+  "— while wearing a tutu",
   "— but only on Tuesdays",
-  "— and nobody will notice",
-  "— if you dare",
-  "— while wearing a hat",
-  "— with dramatic flair"
+  "— and you must sing it",
+  "— with dramatic hand gestures",
+  "— while hopping on one foot",
+  "— and whisper it like a secret"
 ];
 
 function randInt(max) { return Math.floor(Math.random() * max); }
 function randItem(arr) { return arr[randInt(arr.length)]; }
 
-// Generate a prompt for a room ensuring no repeats within a game
+// Generate a prompt for a room ensuring no repeats within a single game
 function pickPromptForRoom(room) {
-  // Build a pool of unused prompts
   const unused = PREFAB_PROMPTS.filter(p => !room.usedPrompts.has(p));
   if (unused.length === 0) {
-    // all used — reset usedPrompts but keep last prompt to avoid immediate repeat
     room.usedPrompts = new Set();
-    // rebuild unused
     unused.push(...PREFAB_PROMPTS);
   }
   const choice = randItem(unused);
   room.usedPrompts.add(choice);
-  // occasionally append a small extra for flavor (20% chance)
-  if (Math.random() < 0.2) {
+  if (Math.random() < 0.25) { // slightly higher chance for goofiness
     return `${choice} ${randItem(EXTRAS)}`;
   }
   return choice;
@@ -264,7 +252,6 @@ function startSubmissionPhase(roomId) {
   room.submissions = new Map();
   room.votes = new Map();
 
-  // Ensure currentPrompt exists
   if (!room.currentPrompt) room.currentPrompt = pickPromptForRoom(room);
 
   broadcast(roomId, {
@@ -286,7 +273,6 @@ function endSubmissionPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  // Fill blanks for non-submitters
   for (const pid of room.players.keys()) {
     if (!room.submissions.has(pid)) room.submissions.set(pid, '');
   }
@@ -354,7 +340,6 @@ function endVotingPhase(roomId) {
   if (room.roundIndex >= ROUNDS_PER_GAME) {
     endGame(roomId);
   } else {
-    // pick a new prompt for the next round (no repeats within game)
     room.currentPrompt = pickPromptForRoom(room);
     setTimeout(() => { startSubmissionPhase(roomId); }, 3000);
   }
@@ -525,6 +510,11 @@ wss.on('connection', (ws, req) => {
         if (!room) return;
         if (room.phase !== 'voting') {
           sendToPlayer(ws, { type: 'error', message: 'Not accepting votes now' });
+          return;
+        }
+        // Prevent voting for your own answer
+        if (votedId === playerId) {
+          sendToPlayer(ws, { type: 'error', message: 'You cannot vote for your own answer' });
           return;
         }
         if (!room.players.has(votedId)) {
