@@ -2,14 +2,11 @@
 'use strict';
 
 /*
-  Quiplash-like game server
-  - WebSocket-based
-  - Lobbies (max 8 players)
-  - Ready/unready, host is first joiner
-  - 5 rounds: submission -> voting -> results
-  - Votes award points; final winner announced
-  - Simple in-memory state (no DB). Restart clears state.
-  - Modified: host can start game even if only 1 player (useful for testing)
+  Quiplash-like game server (updated)
+  - Prompts are now randomized every round (no repeated fixed list)
+  - Submission and voting timers are 60s
+  - Broadcasts submission progress (playerSubmitted / allSubmissions)
+  - In-memory state; restart clears state
 */
 
 const http = require('http');
@@ -18,19 +15,18 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 3000;
 const MAX_MESSAGE_SIZE = 64 * 1024;
 const PING_INTERVAL_MS = 30_000;
-const STALE_CLIENT_MS = 120_000;
 
 const MAX_PLAYERS_PER_LOBBY = 8;
 const ROUNDS_PER_GAME = 5;
-const SUBMISSION_SECONDS = 30;
-const VOTING_SECONDS = 20;
+const SUBMISSION_SECONDS = 60; // 1 minute
+const VOTING_SECONDS = 60;     // 1 minute
 
 // --- Utilities ---
 const makeId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const safeParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 const safeString = (v, fallback = '') => (typeof v === 'string' ? v.trim().slice(0, 500) : fallback);
 
-// --- Server + WebSocket bootstrap ---
+// --- Server bootstrap ---
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Quiplash server OK');
@@ -38,23 +34,8 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_SIZE });
 
 // --- In-memory state ---
-/*
-rooms: Map<roomId, {
-  id,
-  players: Map<playerId, { id, name, ws, ready, joinedAt, score }>,
-  hostId,
-  phase: 'lobby'|'submission'|'voting'|'results'|'ended',
-  roundIndex,
-  prompts: [string],
-  currentPrompt: string,
-  submissions: Map<playerId, text>,
-  votes: Map<voterId, votedPlayerId>,
-  timers: { submissionTimer, votingTimer }
-}>
-*/
 const rooms = new Map();
 
-// --- Helpers ---
 function ensureRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
@@ -63,7 +44,7 @@ function ensureRoom(roomId) {
       hostId: null,
       phase: 'lobby',
       roundIndex: 0,
-      prompts: [],
+      // prompts are generated per-round now
       currentPrompt: null,
       submissions: new Map(),
       votes: new Map(),
@@ -96,7 +77,6 @@ function snapshotPlayers(room) {
   for (const [id, p] of room.players.entries()) {
     arr.push({ id, name: p.name, ready: !!p.ready, score: p.score || 0, joinedAt: p.joinedAt });
   }
-  // sort by joinedAt for deterministic host selection
   arr.sort((a,b) => a.joinedAt - b.joinedAt);
   return arr;
 }
@@ -104,11 +84,8 @@ function snapshotPlayers(room) {
 function pickHostIfNeeded(room) {
   if (!room.hostId) {
     const players = snapshotPlayers(room);
-    if (players.length > 0) {
-      room.hostId = players[0].id;
-    }
+    if (players.length > 0) room.hostId = players[0].id;
   } else {
-    // ensure host still present
     if (!room.players.has(room.hostId)) {
       const players = snapshotPlayers(room);
       room.hostId = players.length ? players[0].id : null;
@@ -126,29 +103,116 @@ function resetGameState(room) {
   for (const p of room.players.values()) { p.score = p.score || 0; p.ready = false; }
 }
 
-// --- Game flow functions ---
+// --- Prompt generation (random each round) ---
+function randInt(max) {
+  return Math.floor(Math.random() * max);
+}
+
+const PROMPT_BASE = [
+  "My secret talent is ___",
+  "The worst thing to say on a first date is ___",
+  "If I were invisible for a day I'd ___",
+  "The new reality show should be called ___",
+  "The worst superpower is ___",
+  "My autobiography would be titled ___",
+  "The strangest thing I keep in my fridge is ___",
+  "The best excuse to leave a party early is ___",
+  "The most useless invention is ___",
+  "If pets could talk they'd say ___",
+  "The worst advice I ever got was ___",
+  "A terrible theme for a children's book is ___",
+  "The last thing I would bring to a desert island is ___",
+  "The most awkward thing to say at a funeral is ___",
+  "If I had a time machine I'd go to ___",
+  "The worst job interview answer is ___",
+  "The strangest hobby I secretly enjoy is ___",
+  "A bad name for a perfume would be ___",
+  "The worst thing to shout in a crowded elevator is ___",
+  "If I were a villain my catchphrase would be ___"
+];
+
+const PROMPT_MODIFIERS = [
+  "for a reality show",
+  "in a fantasy world",
+  "on a first date",
+  "at a job interview",
+  "as a superhero",
+  "in a horror movie",
+  "as a product name",
+  "as a children's story",
+  "as a late-night ad",
+  "as a motivational quote",
+  "during a blackout",
+  "on a spaceship",
+  "at a family reunion",
+  "in a cooking show",
+  "as a board game title"
+];
+
+const PROMPT_ADJECTIVES = [
+  "absurd",
+  "awkward",
+  "unexpected",
+  "hilarious",
+  "dark",
+  "silly",
+  "surprising",
+  "bizarre",
+  "delightful",
+  "ridiculous"
+];
+
+function generatePromptSingle() {
+  // pick a base
+  const base = PROMPT_BASE[randInt(PROMPT_BASE.length)];
+  // 50% chance to add a modifier
+  let prompt = base;
+  if (Math.random() < 0.6) {
+    const mod = PROMPT_MODIFIERS[randInt(PROMPT_MODIFIERS.length)];
+    // if base contains '___' keep it; otherwise append modifier before blank
+    if (base.includes('___')) {
+      // sometimes insert modifier before blank
+      prompt = base.replace('___', `${mod} ___`);
+    } else {
+      prompt = `${base} ${mod} ___`;
+    }
+  }
+  // 30% chance to prepend an adjective phrase
+  if (Math.random() < 0.3) {
+    const adj = PROMPT_ADJECTIVES[randInt(PROMPT_ADJECTIVES.length)];
+    prompt = `${adj.charAt(0).toUpperCase() + adj.slice(1)}: ${prompt}`;
+  }
+  // small random punctuation tweak
+  if (Math.random() < 0.15) prompt = prompt.replace(/\?$/, '') + '...';
+  return prompt;
+}
+
+function generatePrompts(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(generatePromptSingle());
+  return out;
+}
+
+// --- Game flow ---
 function startGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  // allow starting with 1 player (useful for testing)
   if (room.players.size === 0) {
     broadcast(roomId, { type: 'error', message: 'No players in room' });
     return;
   }
 
-  // seed prompts if empty (placeholder prompts)
-  if (!room.prompts || room.prompts.length < ROUNDS_PER_GAME) {
-    room.prompts = generatePrompts(ROUNDS_PER_GAME);
-  }
+  // pick a fresh prompt for the first round
   room.roundIndex = 0;
   room.phase = 'submission';
   room.submissions = new Map();
   room.votes = new Map();
-  room.currentPrompt = room.prompts[room.roundIndex];
-  // reset scores if new game
+  room.currentPrompt = generatePromptSingle();
+
   for (const p of room.players.values()) p.score = 0;
-  broadcast(roomId, { type: 'gameStarted', rounds: ROUNDS_PER_GAME, prompt: room.currentPrompt });
+
+  broadcast(roomId, { type: 'gameStarted', rounds: ROUNDS_PER_GAME, prompt: room.currentPrompt, seconds: SUBMISSION_SECONDS, playersCount: room.players.size });
   startSubmissionPhase(roomId);
 }
 
@@ -158,8 +222,9 @@ function startSubmissionPhase(roomId) {
   room.phase = 'submission';
   room.submissions = new Map();
   room.votes = new Map();
-  broadcast(roomId, { type: 'roundStarted', round: room.roundIndex + 1, prompt: room.currentPrompt, phase: 'submission', seconds: SUBMISSION_SECONDS });
-  // set timer
+  // ensure currentPrompt exists (should be set by caller)
+  if (!room.currentPrompt) room.currentPrompt = generatePromptSingle();
+  broadcast(roomId, { type: 'roundStarted', round: room.roundIndex + 1, prompt: room.currentPrompt, phase: 'submission', seconds: SUBMISSION_SECONDS, totalPlayers: room.players.size });
   clearTimers(room);
   room.timers.submissionTimer = setTimeout(() => {
     endSubmissionPhase(roomId);
@@ -169,11 +234,9 @@ function startSubmissionPhase(roomId) {
 function endSubmissionPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-  // ensure everyone who didn't submit gets empty string
   for (const pid of room.players.keys()) {
-    if (!room.submissions.has(pid)) room.submissions.set(pid, ''); // blank submission
+    if (!room.submissions.has(pid)) room.submissions.set(pid, '');
   }
-  // move to voting
   startVotingPhase(roomId);
 }
 
@@ -181,12 +244,9 @@ function startVotingPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
   room.phase = 'voting';
-  // prepare voting payload: list of submissions (id, text)
   const submissions = [];
-  for (const [pid, text] of room.submissions.entries()) {
-    submissions.push({ id: pid, text });
-  }
-  // shuffle submissions so voters don't know who wrote what (simple Fisher-Yates)
+  for (const [pid, text] of room.submissions.entries()) submissions.push({ id: pid, text });
+  // shuffle submissions
   for (let i = submissions.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [submissions[i], submissions[j]] = [submissions[j], submissions[i]];
@@ -201,32 +261,27 @@ function startVotingPhase(roomId) {
 function endVotingPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-  // tally votes: votes Map<voterId, votedPlayerId>
-  const tally = new Map(); // targetId -> count
+  const tally = new Map();
   for (const voted of room.votes.values()) {
     if (!tally.has(voted)) tally.set(voted, 0);
     tally.set(voted, tally.get(voted) + 1);
   }
-  // award points: simple rule: each vote = 1 point
   for (const [targetId, count] of tally.entries()) {
     const player = room.players.get(targetId);
     if (player) player.score = (player.score || 0) + count;
   }
-  // prepare results payload
   const results = [];
   for (const [pid, p] of room.players.entries()) {
     results.push({ id: pid, name: p.name, score: p.score || 0, submission: room.submissions.get(pid) || '', votes: tally.get(pid) || 0 });
   }
-  // sort results by votes desc
   results.sort((a,b) => (b.votes || 0) - (a.votes || 0));
   broadcast(roomId, { type: 'roundResults', round: room.roundIndex + 1, results });
-  // next round or end game
   room.roundIndex++;
   if (room.roundIndex >= ROUNDS_PER_GAME) {
     endGame(roomId);
   } else {
-    // set next prompt and start next round after short delay
-    room.currentPrompt = room.prompts[room.roundIndex];
+    // pick a new random prompt for the next round
+    room.currentPrompt = generatePromptSingle();
     setTimeout(() => {
       startSubmissionPhase(roomId);
     }, 3000);
@@ -237,12 +292,10 @@ function endGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
   room.phase = 'ended';
-  // compute final standings
   const standings = [];
   for (const [pid, p] of room.players.entries()) standings.push({ id: pid, name: p.name, score: p.score || 0 });
   standings.sort((a,b) => (b.score || 0) - (a.score || 0));
   broadcast(roomId, { type: 'gameOver', standings });
-  // reset ready flags but keep scores if you want; here we keep scores and set phase to lobby after short delay
   setTimeout(() => {
     resetGameState(room);
     pickHostIfNeeded(room);
@@ -256,34 +309,12 @@ function clearTimers(room) {
   if (room.timers.votingTimer) { clearTimeout(room.timers.votingTimer); room.timers.votingTimer = null; }
 }
 
-// simple prompt generator (placeholder)
-function generatePrompts(n) {
-  const base = [
-    "My secret talent is ___",
-    "The worst thing to say on a first date is ___",
-    "If I were invisible for a day I'd ___",
-    "The new reality show should be called ___",
-    "The worst superpower is ___",
-    "My autobiography would be titled ___",
-    "The strangest thing I keep in my fridge is ___",
-    "The best excuse to leave a party early is ___",
-    "The most useless invention is ___",
-    "If pets could talk they'd say ___"
-  ];
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    out.push(base[i % base.length]);
-  }
-  return out;
-}
-
-// --- Connection handling ---
+// --- WebSocket handling ---
 wss.on('connection', (ws, req) => {
   const playerId = makeId();
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  // send assigned id immediately
   sendToPlayer(ws, { type: 'id', id: playerId });
 
   ws.on('message', (raw) => {
@@ -292,34 +323,28 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
       case 'join': {
-        // payload: { room, name }
         const roomId = safeString(msg.room || 'lobby');
         const name = safeString(msg.name || ('Player-' + playerId.slice(-4)));
         const room = ensureRoom(roomId);
 
-        // enforce max players
         if (room.players.size >= MAX_PLAYERS_PER_LOBBY) {
           sendToPlayer(ws, { type: 'error', message: 'Lobby full' });
           try { ws.close(); } catch {}
           return;
         }
 
-        // add player
         const joinedAt = Date.now();
         room.players.set(playerId, { id: playerId, name, ws, ready: false, joinedAt, score: 0 });
         pickHostIfNeeded(room);
 
-        // send snapshot to new player
         sendToPlayer(ws, { type: 'joined', id: playerId, room: roomId, hostId: room.hostId, players: snapshotPlayers(room), phase: room.phase });
 
-        // notify others
         broadcast(roomId, { type: 'playerJoined', player: { id: playerId, name, ready: false, score: 0 } }, playerId);
 
         // if game already in progress, send current phase info
         if (room.phase === 'submission') {
-          sendToPlayer(ws, { type: 'roundStarted', round: room.roundIndex + 1, prompt: room.currentPrompt, phase: 'submission', seconds: SUBMISSION_SECONDS });
+          sendToPlayer(ws, { type: 'roundStarted', round: room.roundIndex + 1, prompt: room.currentPrompt, phase: 'submission', seconds: SUBMISSION_SECONDS, totalPlayers: room.players.size });
         } else if (room.phase === 'voting') {
-          // send voting state (we'll send submissions anonymized)
           const submissions = [];
           for (const [pid, text] of room.submissions.entries()) submissions.push({ id: pid, text });
           sendToPlayer(ws, { type: 'votingStarted', round: room.roundIndex + 1, submissions, seconds: VOTING_SECONDS });
@@ -329,7 +354,6 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'ready': {
-        // payload: { room }
         const roomId = safeString(msg.room || 'lobby');
         const room = rooms.get(roomId);
         if (!room) return;
@@ -337,10 +361,8 @@ wss.on('connection', (ws, req) => {
         if (!p) return;
         p.ready = true;
         broadcast(roomId, { type: 'playerReady', id: playerId });
-        // if everyone ready and host exists, host can start; optionally auto-start if you want:
         const allReady = Array.from(room.players.values()).length >= 1 && Array.from(room.players.values()).every(x => x.ready);
         if (allReady) {
-          // notify host that game can be started
           if (room.hostId && room.players.has(room.hostId)) {
             const host = room.players.get(room.hostId);
             sendToPlayer(host.ws, { type: 'allReady', message: 'All players ready. You can start the game.' });
@@ -361,7 +383,6 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'startGame': {
-        // only host can start
         const roomId = safeString(msg.room || 'lobby');
         const room = rooms.get(roomId);
         if (!room) return;
@@ -375,7 +396,6 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'submit': {
-        // payload: { room, text }
         const roomId = safeString(msg.room || 'lobby');
         const text = safeString(msg.text || '');
         const room = rooms.get(roomId);
@@ -384,11 +404,17 @@ wss.on('connection', (ws, req) => {
           sendToPlayer(ws, { type: 'error', message: 'Not accepting submissions now' });
           return;
         }
-        // record submission
         room.submissions.set(playerId, text);
+
+        // broadcast submission progress to room
+        broadcast(roomId, { type: 'playerSubmitted', id: playerId, count: room.submissions.size, total: room.players.size });
+
+        // ack to submitter
         sendToPlayer(ws, { type: 'submissionReceived', id: playerId });
-        // optional: if all submissions in, end early
+
+        // if all submissions in, notify and end early
         if (room.submissions.size >= room.players.size) {
+          broadcast(roomId, { type: 'allSubmissions', count: room.submissions.size, total: room.players.size });
           clearTimeout(room.timers.submissionTimer);
           endSubmissionPhase(roomId);
         }
@@ -396,7 +422,6 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'vote': {
-        // payload: { room, votedId }
         const roomId = safeString(msg.room || 'lobby');
         const votedId = safeString(msg.votedId || '');
         const room = rooms.get(roomId);
@@ -405,14 +430,13 @@ wss.on('connection', (ws, req) => {
           sendToPlayer(ws, { type: 'error', message: 'Not accepting votes now' });
           return;
         }
-        // record vote (one vote per voter; overwrite allowed)
         if (!room.players.has(votedId)) {
           sendToPlayer(ws, { type: 'error', message: 'Invalid vote target' });
           return;
         }
         room.votes.set(playerId, votedId);
         sendToPlayer(ws, { type: 'voteReceived', from: playerId, voted: votedId });
-        // optional: if all votes in, end early
+
         if (room.votes.size >= room.players.size) {
           clearTimeout(room.timers.votingTimer);
           endVotingPhase(roomId);
@@ -421,7 +445,6 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'chat': {
-        // simple chat broadcast in room
         const roomId = safeString(msg.room || 'lobby');
         const text = safeString(msg.text || '');
         const room = rooms.get(roomId);
@@ -433,7 +456,6 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'leave': {
-        // client requests leave
         const roomId = safeString(msg.room || 'lobby');
         const room = rooms.get(roomId);
         if (!room) return;
@@ -441,7 +463,6 @@ wss.on('connection', (ws, req) => {
           room.players.delete(playerId);
           broadcast(roomId, { type: 'playerLeft', id: playerId });
           pickHostIfNeeded(room);
-          // if no players left, delete room
           if (room.players.size === 0) {
             clearTimers(room);
             rooms.delete(roomId);
@@ -456,7 +477,6 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    // remove player from any room they were in
     for (const [roomId, room] of rooms.entries()) {
       if (room.players.has(playerId)) {
         room.players.delete(playerId);
@@ -470,12 +490,10 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('error', () => {
-    // ignore; close will handle cleanup
-  });
+  ws.on('error', () => {});
 });
 
-// ping/pong keepalive and stale cleanup
+// ping/pong keepalive
 const pingInterval = setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
@@ -484,12 +502,10 @@ const pingInterval = setInterval(() => {
   }
 }, PING_INTERVAL_MS);
 
-// start server
 server.listen(PORT, () => {
   console.log(`Quiplash server listening on ws://localhost:${PORT}`);
 });
 
-// graceful shutdown
 function shutdown() {
   clearInterval(pingInterval);
   for (const room of rooms.values()) clearTimers(room);
