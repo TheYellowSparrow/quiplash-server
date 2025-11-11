@@ -2,10 +2,11 @@
 'use strict';
 
 /*
-  Quiplash-like game server (updated full script)
-  - Fresh randomized prompt every round (no reused fixed list)
-  - Optional OpenAI fallback for prompts via OPENAI_API_KEY
-  - 60s submission and 60s voting timers (reset between phases)
+  Quiplash-like game server (prefab prompts)
+  - Uses a long curated list of prefab prompts to avoid nonsensical generation
+  - Appends a small set of optional extras occasionally for variety
+  - Ensures prompts are not repeated within a single game
+  - 60s submission and 60s voting timers
   - Broadcasts submission progress (playerSubmitted / allSubmissions)
   - Ends phases early if everyone submits or votes
   - In-memory state; restart clears state
@@ -13,9 +14,6 @@
 
 const http = require('http');
 const WebSocket = require('ws');
-
-// If running on Node < 18, provide fetch via node-fetch dynamically
-const fetch = global.fetch || ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
 const PORT = process.env.PORT || 3000;
 const MAX_MESSAGE_SIZE = 64 * 1024;
@@ -50,6 +48,7 @@ function ensureRoom(roomId) {
       phase: 'lobby',
       roundIndex: 0,
       currentPrompt: null,
+      usedPrompts: new Set(),
       submissions: new Map(),
       votes: new Map(),
       timers: {}
@@ -101,157 +100,135 @@ function resetGameState(room) {
   room.phase = 'lobby';
   room.roundIndex = 0;
   room.currentPrompt = null;
+  room.usedPrompts = new Set();
   room.submissions = new Map();
   room.votes = new Map();
   clearTimers(room);
   for (const p of room.players.values()) { p.score = p.score || 0; p.ready = false; }
 }
 
-// ===== Funny prompt generator (local, per-round randomized) =====
-const PROMPT_THEMES = {
-  everyday: [
-    "The illegal new flavor of potato chips is ___",
-    "My cat’s secret 5-year plan includes ___",
-    "A mysterious item always found in my pockets is ___",
-    "The most polite way to return a borrowed lawnmower is ___",
-    "My most chaotic alarm sound would be ___",
-    "The last thing I’d delete from my phone is ___",
-  ],
-  dating: [
-    "The fastest way to end a first date is ___",
-    "A cursed engagement ring feature is ___",
-    "My red flag disguised as a fun fact is ___",
-    "The line that gets you banned from wedding toasts is ___",
-    "The most confusing reply to “wyd?” is ___",
-  ],
-  work: [
-    "The worst email sign-off is ___",
-    "The most cursed Zoom background is ___",
-    "Detention for doing ___",
-    "A dystopian new company motto is ___",
-    "The weirdest extra credit assignment is ___",
-  ],
-  inventions: [
-    "The app that exists only to ___",
-    "Teleportation works perfectly, but you always arrive ___",
-    "A vending machine that dispenses ___ when you press “Surprise”",
-    "A magic mirror that roasts you for ___",
-    "Flying shoes that only lift you when ___",
-  ],
-  pop: [
-    "The franchise that should never be rebooted as ___",
-    "Contestants compete by ___ in a new reality show",
-    "A superhero’s useless power is ___",
-    "The post-credits reveal is ___",
-    "The challenge everyone regrets is ___",
-  ],
-  food: [
-    "Cursed pizza topped with ___ and regret",
-    "Earn a Michelin star by serving ___",
-    "Soup becomes interesting when ___",
-    "You’re banned from the buffet after piling ___",
-    "Ask for the secret menu item ___ and they nod silently",
-  ],
-  life: [
-    "You wake up with the ability to ___",
-    "A tiny inconvenience that ruins the week is ___",
-    "We celebrate ___ by doing ___",
-    "The brag that only impresses three people is ___",
-    "Genie grants your wish but adds ___",
-  ],
-  time: [
-    "A gladiator’s subtweet would say ___",
-    "In 2099 we pay with ___",
-    "1-star review for Earth: “___”",
-    "The silly thing that ends civilization is ___",
-    "Mars HOA fines you for ___",
-  ],
-};
-
-const MODIFIERS = [
-  "in a fantasy world",
-  "during a blackout",
-  "on a spaceship",
-  "at a family reunion",
-  "as a motivational quote",
-  "as a product tagline",
-  "on a reality show",
-  "at a job interview",
-  "in a horror movie",
-  "as a children’s story"
+// --- Prefab prompts and extras ---
+// Curated list of clear, playable prompts. Add or edit to match your group's humor.
+const PREFAB_PROMPTS = [
+  "The worst thing to say on a first date is ___",
+  "My secret talent is ___",
+  "The strangest thing I keep in my fridge is ___",
+  "A terrible name for a perfume is ___",
+  "If pets could talk they'd say ___",
+  "The worst excuse to leave a party early is ___",
+  "The most useless invention is ___",
+  "The new reality show should be called ___",
+  "The worst superpower is ___",
+  "My autobiography would be titled ___",
+  "The best excuse to miss work is ___",
+  "A bad slogan for a hospital is ___",
+  "The last thing I would bring to a desert island is ___",
+  "The most awkward thing to say at a funeral is ___",
+  "If I had a time machine I'd go to ___",
+  "The worst job interview answer is ___",
+  "A terrible theme for a children's book is ___",
+  "The strangest hobby I secretly enjoy is ___",
+  "The worst thing to shout in a crowded elevator is ___",
+  "If I were invisible for a day I'd ___",
+  "The most polite way to return a borrowed lawnmower is ___",
+  "The illegal new flavor of potato chips is ___",
+  "My cat’s secret five-year plan includes ___",
+  "The best prank to play on your roommate is ___",
+  "A cursed pizza topping is ___",
+  "The worst thing to put on a resume is ___",
+  "The most confusing reply to 'wyd?' is ___",
+  "A terrible wedding toast line is ___",
+  "The worst thing to say to your boss is ___",
+  "The most awkward thing to find in your pockets is ___",
+  "A bad name for a startup is ___",
+  "The worst thing to whisper during a movie is ___",
+  "The most ridiculous law would ban ___",
+  "The worst mascot for a cereal is ___",
+  "A terrible app idea is ___",
+  "The worst thing to write on a cake is ___",
+  "The most useless life hack is ___",
+  "The worst thing to hear from your Uber driver is ___",
+  "A bad theme for a children's party is ___",
+  "The strangest thing to collect is ___",
+  "The worst flavor for ice cream is ___",
+  "A terrible slogan for a gym is ___",
+  "The worst thing to say at a job interview is ___",
+  "The most awkward thing to say on a first call is ___",
+  "The worst thing to find in your sandwich is ___",
+  "A cursed board game rule is ___",
+  "The worst name for a pet is ___",
+  "The most embarrassing ringtone is ___",
+  "A bad idea for a reality show challenge is ___",
+  "The worst thing to write in a birthday card is ___",
+  "The most useless superpower is ___",
+  "A terrible flavor for coffee is ___",
+  "The worst thing to say at a graduation speech is ___",
+  "A bad name for a perfume is ___",
+  "The worst thing to announce on a bus is ___",
+  "The most awkward thing to say to your neighbor is ___",
+  "A terrible slogan for a bakery is ___",
+  "The worst thing to find in a hotel room is ___",
+  "A bad name for a children's toy is ___",
+  "The worst thing to say during a toast is ___",
+  "The most ridiculous holiday would celebrate ___",
+  "A terrible name for a superhero is ___",
+  "The worst thing to put on a pizza is ___",
+  "A bad tagline for a dating app is ___",
+  "The most awkward thing to say at a family dinner is ___",
+  "A terrible name for a podcast is ___",
+  "The worst thing to say to a teacher is ___",
+  "A bad slogan for a dentist is ___",
+  "The most useless invention for the kitchen is ___",
+  "A terrible flavor for a soda is ___",
+  "The worst thing to say during a job interview is ___",
+  "A bad name for a fashion brand is ___",
+  "The most awkward thing to find in your backpack is ___",
+  "A terrible idea for a theme park ride is ___",
+  "The worst thing to say on live TV is ___",
+  "A bad name for a cocktail is ___",
+  "The most ridiculous product to crowdfund is ___",
+  "A terrible name for a band is ___",
+  "The worst thing to text your boss is ___",
+  "A bad slogan for a funeral home is ___",
+  "The most awkward thing to say at a reunion is ___",
+  "A terrible name for a baby is ___",
+  "The worst thing to put on a resume is ___"
 ];
 
-const ADJECTIVES = [
-  "absurd", "awkward", "unexpected", "hilarious",
-  "dark", "silly", "surprising", "bizarre", "delightful", "ridiculous"
+// Small set of safe extras to append occasionally for variety
+const EXTRAS = [
+  "— in 30 seconds or less",
+  "— but only on Tuesdays",
+  "— and nobody will notice",
+  "— if you dare",
+  "— while wearing a hat",
+  "— with dramatic flair"
 ];
 
-function randItem(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function randInt(max) { return Math.floor(Math.random() * max); }
+function randItem(arr) { return arr[randInt(arr.length)]; }
 
-function spicePrompt(base) {
-  if (Math.random() < 0.6) {
-    const mod = randItem(MODIFIERS);
-    if (base.includes("___")) base = base.replace("___", `${mod} ___`);
-    else base = `${base} ${mod} ___`;
+// Generate a prompt for a room ensuring no repeats within a game
+function pickPromptForRoom(room) {
+  // Build a pool of unused prompts
+  const unused = PREFAB_PROMPTS.filter(p => !room.usedPrompts.has(p));
+  if (unused.length === 0) {
+    // all used — reset usedPrompts but keep last prompt to avoid immediate repeat
+    room.usedPrompts = new Set();
+    // rebuild unused
+    unused.push(...PREFAB_PROMPTS);
   }
-  if (Math.random() < 0.3) {
-    const adj = randItem(ADJECTIVES);
-    base = `${adj.charAt(0).toUpperCase() + adj.slice(1)}: ${base}`;
+  const choice = randItem(unused);
+  room.usedPrompts.add(choice);
+  // occasionally append a small extra for flavor (20% chance)
+  if (Math.random() < 0.2) {
+    return `${choice} ${randItem(EXTRAS)}`;
   }
-  if (Math.random() < 0.15) base = base.replace(/\?$/, "") + "...";
-  return base;
+  return choice;
 }
 
-function generatePromptSingle() {
-  const themeKeys = Object.keys(PROMPT_THEMES);
-  const theme = randItem(themeKeys);
-  const base = randItem(PROMPT_THEMES[theme]);
-  return spicePrompt(base);
-}
-
-// Optional: ask OpenAI for a fresh prompt (fallback to local if fails)
-// Set OPENAI_API_KEY in your environment to enable
-async function generatePromptAI() {
-  if (!process.env.OPENAI_API_KEY) return null;
-  try {
-    const prompt = `Give one original, funny party game prompt with a blank using "___".
-Avoid profanity and slurs. Keep it under 120 characters.`;
-
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: "You generate creative, safe party game prompts." },
-          { role: "user", content: prompt }
-        ],
-        temperature: 0.9,
-        max_tokens: 80,
-      })
-    });
-
-    const data = await res.json();
-    const text = data?.choices?.[0]?.message?.content?.trim();
-    if (text && text.includes("___")) return text;
-    if (text) return text.replace(/\s*$/, " ___");
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-// Wrapper that prefers AI if available, falls back to local
-async function getFreshPrompt() {
-  const ai = await generatePromptAI();
-  return ai || generatePromptSingle();
-}
-
-// --- Game flow (async for prompt fetching) ---
-async function startGame(roomId) {
+// --- Game flow ---
+function startGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
@@ -264,7 +241,8 @@ async function startGame(roomId) {
   room.phase = 'submission';
   room.submissions = new Map();
   room.votes = new Map();
-  room.currentPrompt = await getFreshPrompt();
+  room.usedPrompts = new Set();
+  room.currentPrompt = pickPromptForRoom(room);
 
   for (const p of room.players.values()) p.score = 0;
 
@@ -286,7 +264,9 @@ function startSubmissionPhase(roomId) {
   room.submissions = new Map();
   room.votes = new Map();
 
-  // Ensure a prompt exists (async prefetch done in startGame/endVotingPhase)
+  // Ensure currentPrompt exists
+  if (!room.currentPrompt) room.currentPrompt = pickPromptForRoom(room);
+
   broadcast(roomId, {
     type: 'roundStarted',
     round: room.roundIndex + 1,
@@ -341,7 +321,7 @@ function startVotingPhase(roomId) {
   }, VOTING_SECONDS * 1000);
 }
 
-async function endVotingPhase(roomId) {
+function endVotingPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
@@ -374,14 +354,9 @@ async function endVotingPhase(roomId) {
   if (room.roundIndex >= ROUNDS_PER_GAME) {
     endGame(roomId);
   } else {
-    // Get a brand-new prompt for the next round
-    getFreshPrompt().then((nextPrompt) => {
-      room.currentPrompt = nextPrompt;
-      setTimeout(() => { startSubmissionPhase(roomId); }, 3000);
-    }).catch(() => {
-      room.currentPrompt = generatePromptSingle();
-      setTimeout(() => { startSubmissionPhase(roomId); }, 3000);
-    });
+    // pick a new prompt for the next round (no repeats within game)
+    room.currentPrompt = pickPromptForRoom(room);
+    setTimeout(() => { startSubmissionPhase(roomId); }, 3000);
   }
 }
 
