@@ -3,11 +3,11 @@
 
 /*
   Quiplash-like game server
-  - Goofier prefab prompts + occasional silly extras
+  - Prefab goofy prompts, no repeats within a game
   - 60s submission and 60s voting timers
   - Broadcasts submission progress (playerSubmitted / allSubmissions)
-  - Ends phases early if everyone submits or votes
   - Prevents voting for your own answer (server-side)
+  - Broadcasts lobby counts to all connected clients (lobbyList / lobbyInfo)
   - In-memory state; restart clears state
 */
 
@@ -20,15 +20,15 @@ const PING_INTERVAL_MS = 30_000;
 
 const MAX_PLAYERS_PER_LOBBY = 8;
 const ROUNDS_PER_GAME = 5;
-const SUBMISSION_SECONDS = 60; // 1 minute submission
-const VOTING_SECONDS = 60;     // 1 minute voting
+const SUBMISSION_SECONDS = 60;
+const VOTING_SECONDS = 60;
 
 // --- Utilities ---
 const makeId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const safeParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 const safeString = (v, fallback = '') => (typeof v === 'string' ? v.trim().slice(0, 500) : fallback);
 
-// --- Server bootstrap ---
+// --- HTTP + WS bootstrap ---
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Quiplash server OK');
@@ -42,20 +42,30 @@ function ensureRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
       id: roomId,
-      players: new Map(),
+      players: new Map(),    // playerId -> { id, name, ws, ready, joinedAt, score }
       hostId: null,
       phase: 'lobby',
       roundIndex: 0,
       currentPrompt: null,
       usedPrompts: new Set(),
-      submissions: new Map(),
-      votes: new Map(),
+      submissions: new Map(), // playerId -> text
+      votes: new Map(),       // voterId -> votedId
       timers: {}
     });
   }
   return rooms.get(roomId);
 }
 
+function snapshotPlayers(room) {
+  const arr = [];
+  for (const [id, p] of room.players.entries()) {
+    arr.push({ id, name: p.name, ready: !!p.ready, score: p.score || 0, joinedAt: p.joinedAt });
+  }
+  arr.sort((a,b) => a.joinedAt - b.joinedAt);
+  return arr;
+}
+
+// send to all clients in a room (except optional exceptId)
 function broadcast(roomId, payload, exceptId = null) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -70,17 +80,33 @@ function broadcast(roomId, payload, exceptId = null) {
   }
 }
 
+// send to a single ws
 function sendToPlayer(ws, payload) {
   try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload)); } catch (e) {}
 }
 
-function snapshotPlayers(room) {
-  const arr = [];
-  for (const [id, p] of room.players.entries()) {
-    arr.push({ id, name: p.name, ready: !!p.ready, score: p.score || 0, joinedAt: p.joinedAt });
+// send to every connected ws client (global)
+function broadcastAll(payload) {
+  const str = JSON.stringify(payload);
+  for (const ws of wss.clients) {
+    try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(str); } catch (e) {}
   }
-  arr.sort((a,b) => a.joinedAt - b.joinedAt);
-  return arr;
+}
+
+// broadcast current counts for all rooms
+function broadcastLobbyList() {
+  const lobbies = [];
+  for (const [id, room] of rooms.entries()) {
+    lobbies.push({ id, count: room.players.size });
+  }
+  broadcastAll({ type: 'lobbyList', lobbies });
+}
+
+// broadcast single-room info
+function broadcastLobbyInfo(roomId) {
+  const room = rooms.get(roomId);
+  const count = room ? room.players.size : 0;
+  broadcastAll({ type: 'lobbyInfo', room: roomId, count });
 }
 
 function pickHostIfNeeded(room) {
@@ -95,6 +121,12 @@ function pickHostIfNeeded(room) {
   }
 }
 
+function clearTimers(room) {
+  if (!room || !room.timers) return;
+  if (room.timers.submissionTimer) { clearTimeout(room.timers.submissionTimer); room.timers.submissionTimer = null; }
+  if (room.timers.votingTimer) { clearTimeout(room.timers.votingTimer); room.timers.votingTimer = null; }
+}
+
 function resetGameState(room) {
   room.phase = 'lobby';
   room.roundIndex = 0;
@@ -106,7 +138,7 @@ function resetGameState(room) {
   for (const p of room.players.values()) { p.score = p.score || 0; p.ready = false; }
 }
 
-// --- Goofier prefab prompts and extras ---
+// --- Goofy prefab prompts + extras ---
 const PREFAB_PROMPTS = [
   "The worst mascot for a breakfast cereal is ___",
   "My cat's secret side hustle is ___",
@@ -200,7 +232,6 @@ const EXTRAS = [
 function randInt(max) { return Math.floor(Math.random() * max); }
 function randItem(arr) { return arr[randInt(arr.length)]; }
 
-// Generate a prompt for a room ensuring no repeats within a single game
 function pickPromptForRoom(room) {
   const unused = PREFAB_PROMPTS.filter(p => !room.usedPrompts.has(p));
   if (unused.length === 0) {
@@ -209,7 +240,7 @@ function pickPromptForRoom(room) {
   }
   const choice = randItem(unused);
   room.usedPrompts.add(choice);
-  if (Math.random() < 0.25) { // slightly higher chance for goofiness
+  if (Math.random() < 0.25) {
     return `${choice} ${randItem(EXTRAS)}`;
   }
   return choice;
@@ -219,7 +250,6 @@ function pickPromptForRoom(room) {
 function startGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-
   if (room.players.size === 0) {
     broadcast(roomId, { type: 'error', message: 'No players in room' });
     return;
@@ -247,11 +277,9 @@ function startGame(roomId) {
 function startSubmissionPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-
   room.phase = 'submission';
   room.submissions = new Map();
   room.votes = new Map();
-
   if (!room.currentPrompt) room.currentPrompt = pickPromptForRoom(room);
 
   broadcast(roomId, {
@@ -264,15 +292,12 @@ function startSubmissionPhase(roomId) {
   });
 
   clearTimers(room);
-  room.timers.submissionTimer = setTimeout(() => {
-    endSubmissionPhase(roomId);
-  }, SUBMISSION_SECONDS * 1000);
+  room.timers.submissionTimer = setTimeout(() => endSubmissionPhase(roomId), SUBMISSION_SECONDS * 1000);
 }
 
 function endSubmissionPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-
   for (const pid of room.players.keys()) {
     if (!room.submissions.has(pid)) room.submissions.set(pid, '');
   }
@@ -282,46 +307,30 @@ function endSubmissionPhase(roomId) {
 function startVotingPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-
   room.phase = 'voting';
-
   const submissions = [];
   for (const [pid, text] of room.submissions.entries()) submissions.push({ id: pid, text });
-
-  // Shuffle submissions
   for (let i = submissions.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [submissions[i], submissions[j]] = [submissions[j], submissions[i]];
   }
-
-  broadcast(roomId, {
-    type: 'votingStarted',
-    round: room.roundIndex + 1,
-    submissions,
-    seconds: VOTING_SECONDS
-  });
-
+  broadcast(roomId, { type: 'votingStarted', round: room.roundIndex + 1, submissions, seconds: VOTING_SECONDS });
   clearTimers(room);
-  room.timers.votingTimer = setTimeout(() => {
-    endVotingPhase(roomId);
-  }, VOTING_SECONDS * 1000);
+  room.timers.votingTimer = setTimeout(() => endVotingPhase(roomId), VOTING_SECONDS * 1000);
 }
 
 function endVotingPhase(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-
   const tally = new Map();
   for (const voted of room.votes.values()) {
     if (!tally.has(voted)) tally.set(voted, 0);
     tally.set(voted, tally.get(voted) + 1);
   }
-
   for (const [targetId, count] of tally.entries()) {
     const player = room.players.get(targetId);
     if (player) player.score = (player.score || 0) + count;
   }
-
   const results = [];
   for (const [pid, p] of room.players.entries()) {
     results.push({
@@ -333,7 +342,6 @@ function endVotingPhase(roomId) {
     });
   }
   results.sort((a,b) => (b.votes || 0) - (a.votes || 0));
-
   broadcast(roomId, { type: 'roundResults', round: room.roundIndex + 1, results });
 
   room.roundIndex++;
@@ -341,35 +349,23 @@ function endVotingPhase(roomId) {
     endGame(roomId);
   } else {
     room.currentPrompt = pickPromptForRoom(room);
-    setTimeout(() => { startSubmissionPhase(roomId); }, 3000);
+    setTimeout(() => startSubmissionPhase(roomId), 3000);
   }
 }
 
 function endGame(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-
   room.phase = 'ended';
-
   const standings = [];
-  for (const [pid, p] of room.players.entries()) {
-    standings.push({ id: pid, name: p.name, score: p.score || 0 });
-  }
+  for (const [pid, p] of room.players.entries()) standings.push({ id: pid, name: p.name, score: p.score || 0 });
   standings.sort((a,b) => (b.score || 0) - (a.score || 0));
-
   broadcast(roomId, { type: 'gameOver', standings });
-
   setTimeout(() => {
     resetGameState(room);
     pickHostIfNeeded(room);
     broadcast(roomId, { type: 'lobby', players: snapshotPlayers(room), hostId: room.hostId });
   }, 5000);
-}
-
-function clearTimers(room) {
-  if (!room || !room.timers) return;
-  if (room.timers.submissionTimer) { clearTimeout(room.timers.submissionTimer); room.timers.submissionTimer = null; }
-  if (room.timers.votingTimer) { clearTimeout(room.timers.votingTimer); room.timers.votingTimer = null; }
 }
 
 // --- WebSocket handling ---
@@ -378,13 +374,26 @@ wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
+  // send id immediately
   sendToPlayer(ws, { type: 'id', id: playerId });
+
+  // also send current lobby list so clients can show counts immediately
+  const lobbies = [];
+  for (const [id, room] of rooms.entries()) lobbies.push({ id, count: room.players.size });
+  sendToPlayer(ws, { type: 'lobbyList', lobbies });
 
   ws.on('message', (raw) => {
     const msg = safeParse(raw);
     if (!msg || typeof msg.type !== 'string') return;
 
     switch (msg.type) {
+      case 'listLobbies': {
+        const l = [];
+        for (const [id, room] of rooms.entries()) l.push({ id, count: room.players.size });
+        sendToPlayer(ws, { type: 'lobbyList', lobbies: l });
+        break;
+      }
+
       case 'join': {
         const roomId = safeString(msg.room || 'lobby');
         const name = safeString(msg.name || ('Player-' + playerId.slice(-4)));
@@ -400,6 +409,7 @@ wss.on('connection', (ws, req) => {
         room.players.set(playerId, { id: playerId, name, ws, ready: false, joinedAt, score: 0 });
         pickHostIfNeeded(room);
 
+        // reply to joiner with full snapshot
         sendToPlayer(ws, {
           type: 'joined',
           id: playerId,
@@ -409,29 +419,42 @@ wss.on('connection', (ws, req) => {
           phase: room.phase
         });
 
-        broadcast(roomId, { type: 'playerJoined', player: { id: playerId, name, ready: false, score: 0 } }, playerId);
+        // broadcast to room that a player joined (include room for global listeners)
+        broadcast(roomId, { type: 'playerJoined', room: roomId, player: { id: playerId, name, ready: false, score: 0 } }, playerId);
 
-        // If game already in progress, send current phase info
+        // update lobby counts globally
+        broadcastLobbyInfo(roomId);
+        broadcastLobbyList();
+
+        // if game in progress, send current phase info to joiner
         if (room.phase === 'submission') {
-          sendToPlayer(ws, {
-            type: 'roundStarted',
-            round: room.roundIndex + 1,
-            prompt: room.currentPrompt,
-            phase: 'submission',
-            seconds: SUBMISSION_SECONDS,
-            totalPlayers: room.players.size
-          });
+          sendToPlayer(ws, { type: 'roundStarted', round: room.roundIndex + 1, prompt: room.currentPrompt, phase: 'submission', seconds: SUBMISSION_SECONDS, totalPlayers: room.players.size });
         } else if (room.phase === 'voting') {
           const submissions = [];
           for (const [pid, text] of room.submissions.entries()) submissions.push({ id: pid, text });
-          sendToPlayer(ws, {
-            type: 'votingStarted',
-            round: room.roundIndex + 1,
-            submissions,
-            seconds: VOTING_SECONDS
-          });
+          sendToPlayer(ws, { type: 'votingStarted', round: room.roundIndex + 1, submissions, seconds: VOTING_SECONDS });
         }
 
+        break;
+      }
+
+      case 'leave': {
+        const roomId = safeString(msg.room || 'lobby');
+        const room = rooms.get(roomId);
+        if (!room) return;
+        if (room.players.has(playerId)) {
+          room.players.delete(playerId);
+          broadcast(roomId, { type: 'playerLeft', room: roomId, id: playerId });
+          pickHostIfNeeded(room);
+          // update counts globally
+          broadcastLobbyInfo(roomId);
+          broadcastLobbyList();
+          if (room.players.size === 0) {
+            clearTimers(room);
+            rooms.delete(roomId);
+            broadcastLobbyList();
+          }
+        }
         break;
       }
 
@@ -444,11 +467,9 @@ wss.on('connection', (ws, req) => {
         p.ready = true;
         broadcast(roomId, { type: 'playerReady', id: playerId });
         const allReady = Array.from(room.players.values()).length >= 1 && Array.from(room.players.values()).every(x => x.ready);
-        if (allReady) {
-          if (room.hostId && room.players.has(room.hostId)) {
-            const host = room.players.get(room.hostId);
-            sendToPlayer(host.ws, { type: 'allReady', message: 'All players ready. You can start the game.' });
-          }
+        if (allReady && room.hostId && room.players.has(room.hostId)) {
+          const host = room.players.get(room.hostId);
+          sendToPlayer(host.ws, { type: 'allReady', message: 'All players ready. You can start the game.' });
         }
         break;
       }
@@ -488,13 +509,13 @@ wss.on('connection', (ws, req) => {
         }
         room.submissions.set(playerId, text);
 
-        // Broadcast submission progress to room
+        // broadcast submission progress to room
         broadcast(roomId, { type: 'playerSubmitted', id: playerId, count: room.submissions.size, total: room.players.size });
 
-        // Ack to submitter
+        // ack to submitter
         sendToPlayer(ws, { type: 'submissionReceived', id: playerId });
 
-        // If all submissions in, notify and end early
+        // if all submissions in, notify and end early
         if (room.submissions.size >= room.players.size) {
           broadcast(roomId, { type: 'allSubmissions', count: room.submissions.size, total: room.players.size });
           if (room.timers.submissionTimer) { clearTimeout(room.timers.submissionTimer); room.timers.submissionTimer = null; }
@@ -542,36 +563,24 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
-      case 'leave': {
-        const roomId = safeString(msg.room || 'lobby');
-        const room = rooms.get(roomId);
-        if (!room) return;
-        if (room.players.has(playerId)) {
-          room.players.delete(playerId);
-          broadcast(roomId, { type: 'playerLeft', id: playerId });
-          pickHostIfNeeded(room);
-          if (room.players.size === 0) {
-            clearTimers(room);
-            rooms.delete(roomId);
-          }
-        }
-        break;
-      }
-
       default:
         sendToPlayer(ws, { type: 'error', message: 'Unknown message type' });
     }
   });
 
   ws.on('close', () => {
+    // remove player from any rooms they were in and broadcast updates
     for (const [roomId, room] of rooms.entries()) {
       if (room.players.has(playerId)) {
         room.players.delete(playerId);
-        broadcast(roomId, { type: 'playerLeft', id: playerId });
+        broadcast(roomId, { type: 'playerLeft', room: roomId, id: playerId });
         pickHostIfNeeded(room);
+        broadcastLobbyInfo(roomId);
+        broadcastLobbyList();
         if (room.players.size === 0) {
           clearTimers(room);
           rooms.delete(roomId);
+          broadcastLobbyList();
         }
       }
     }
